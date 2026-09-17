@@ -155,3 +155,9 @@ x509.genkey
 
 # Documentation toolchain
 sphinx_*/
+
+# Sophgo out-of-tree build directory
+/build/
+
+# Python bytecode cache
+__pycache__/
