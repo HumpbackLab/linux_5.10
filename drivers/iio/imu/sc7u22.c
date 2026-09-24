@@ -6,6 +6,10 @@
 #include <linux/atomic.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>
+#include <linux/gpio/consumer.h>
+#include <linux/hrtimer.h>
+#include <linux/io.h>
+#include <linux/of.h>
 #include <linux/irq.h>
 #include <linux/ktime.h>
 #include <linux/module.h>
@@ -47,10 +51,19 @@
 #define SC_2000DPS        0
 #define SC_POWER_AGT      (BIT(1) | BIT(2) | BIT(3))
 #define SC_PERIOD_NS      5000000LL
+#define SC_FSIN_DIVIDER   10
+#define SC_FSIN_HIGH_NS   100000LL
 
 struct sc7u22 {
 	struct spi_device *spi;
-	struct mutex lock;
+	struct mutex lock, control_lock;
+	struct gpio_desc *fsin_gpio;
+	struct hrtimer fsin_timer;
+	raw_spinlock_t fsin_lock;
+	bool buffered, fsin_enabled, fsin_high;
+	u32 fsin_divider, fsin_limit;
+	u64 fsin_pulses, fsin_last_irq, fsin_rise_ns, fsin_last_irq_ns;
+	u64 fsin_max_rise_delay_ns, fsin_max_high_ns, fsin_overruns;
 	s64 irq_ns, last_ns;
 	bool enabled, discard_first;
 	atomic64_t irqs, pushed, spi_errors, not_ready, late_reads, buffer_drops;
@@ -163,6 +176,69 @@ static int sc_start(struct sc7u22 *st)
 		return ret;
 	return 0;
 }
+/* GPIO is a non-sleeping MMIO controller. Never do SPI, PWM configuration,
+ * logging or a busy wait on the rising-edge path. */
+static enum hrtimer_restart sc_fsin_fall(struct hrtimer *timer)
+{
+	struct sc7u22 *st = container_of(timer, struct sc7u22, fsin_timer);
+	unsigned long flags;
+	u64 now;
+
+	raw_spin_lock_irqsave(&st->fsin_lock, flags);
+	gpiod_set_value(st->fsin_gpio, 0);
+	now = ktime_get_ns();
+	if (st->fsin_high)
+		st->fsin_max_high_ns = max(st->fsin_max_high_ns, now - st->fsin_rise_ns);
+	st->fsin_high = false;
+	raw_spin_unlock_irqrestore(&st->fsin_lock, flags);
+	return HRTIMER_NORESTART;
+}
+
+static void sc_fsin_irq(struct sc7u22 *st, u64 stamp)
+{
+	unsigned long flags;
+	u64 rise;
+
+	if (!st->fsin_gpio)
+		return;
+	raw_spin_lock_irqsave(&st->fsin_lock, flags);
+	if (!st->fsin_enabled || (st->fsin_limit && st->fsin_pulses >= st->fsin_limit))
+		goto out;
+	if (++st->fsin_divider != SC_FSIN_DIVIDER)
+		goto out;
+	st->fsin_divider = 0;
+	if (st->fsin_high) {
+		/* Do not disguise a late falling edge as a new trigger. */
+		++st->fsin_overruns;
+		goto out;
+	}
+	gpiod_set_value(st->fsin_gpio, 1);
+	rise = ktime_get_ns(); /* software bound after the GPIO MMIO write */
+	st->fsin_high = true;
+	st->fsin_rise_ns = rise;
+	st->fsin_last_irq_ns = stamp;
+	st->fsin_last_irq = atomic64_read(&st->irqs);
+	++st->fsin_pulses;
+	st->fsin_max_rise_delay_ns = max(st->fsin_max_rise_delay_ns, rise - stamp);
+	hrtimer_start(&st->fsin_timer, ns_to_ktime(SC_FSIN_HIGH_NS), HRTIMER_MODE_REL_HARD);
+out:
+	raw_spin_unlock_irqrestore(&st->fsin_lock, flags);
+}
+
+/* control_lock serializes this with IIO enable/disable. */
+static void sc_fsin_disarm(struct sc7u22 *st)
+{
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&st->fsin_lock, flags);
+	st->fsin_enabled = false;
+	raw_spin_unlock_irqrestore(&st->fsin_lock, flags);
+	hrtimer_cancel(&st->fsin_timer);
+	if (st->fsin_gpio)
+		gpiod_set_value(st->fsin_gpio, 0);
+	st->fsin_high = false;
+}
+
 static irqreturn_t sc_irq(int irq, void *private)
 {
 	/* Capture immediately, before scheduling or any SPI transaction. */
@@ -171,6 +247,7 @@ static irqreturn_t sc_irq(int irq, void *private)
 
 	WRITE_ONCE(st->irq_ns, now);
 	atomic64_inc(&st->irqs);
+	sc_fsin_irq(st, now);
 	return IRQ_WAKE_THREAD;
 }
 static irqreturn_t sc_thread(int irq, void *private)
@@ -212,6 +289,8 @@ static irqreturn_t sc_thread(int irq, void *private)
 	if (st->last_ns && stamp - st->last_ns > SC_PERIOD_NS * 3 / 2)
 		atomic64_inc(&st->gaps);
 	st->last_ns = stamp;
+	if (!st->buffered)
+		goto out; /* Camera-only mode still reads/acknowledges every DRDY. */
 	for (i = 0; i < 6; ++i)
 		scan.axis[i] = cpu_to_le16(get_unaligned_be16(raw + i * 2));
 	ret = iio_push_to_buffers_with_timestamp(indio, &scan, stamp);
@@ -223,15 +302,13 @@ out:
 	mutex_unlock(&st->lock);
 	return IRQ_HANDLED;
 }
-static int sc_enable(struct iio_dev *indio)
+static int sc_run(struct sc7u22 *st)
 {
-	struct sc7u22 *st = iio_priv(indio);
 	bool armed = false;
 	int ret;
 
-	/* This driver records CLOCK_MONOTONIC in the hard IRQ unconditionally. */
-	if (iio_device_get_clock(indio) != CLOCK_MONOTONIC)
-		return -EINVAL;
+	if (st->enabled)
+		return 0;
 	mutex_lock(&st->lock);
 	st->last_ns = 0;
 	st->discard_first = true;
@@ -258,15 +335,44 @@ static int sc_enable(struct iio_dev *indio)
 		synchronize_irq(st->spi->irq);
 	return ret;
 }
-static int sc_disable(struct iio_dev *indio)
+static void sc_halt(struct sc7u22 *st)
 {
-	struct sc7u22 *st = iio_priv(indio);
-
+	if (!st->enabled)
+		return;
 	disable_irq(st->spi->irq);
 	mutex_lock(&st->lock);
 	st->enabled = false;
 	sc_stop(st);
 	mutex_unlock(&st->lock);
+}
+static int sc_enable(struct iio_dev *indio)
+{
+	struct sc7u22 *st = iio_priv(indio);
+	int ret;
+
+	if (iio_device_get_clock(indio) != CLOCK_MONOTONIC)
+		return -EINVAL;
+	mutex_lock(&st->control_lock);
+	ret = sc_run(st);
+	if (!ret) {
+		mutex_lock(&st->lock);
+		st->buffered = true;
+		mutex_unlock(&st->lock);
+	}
+	mutex_unlock(&st->control_lock);
+	return ret;
+}
+static int sc_disable(struct iio_dev *indio)
+{
+	struct sc7u22 *st = iio_priv(indio);
+
+	mutex_lock(&st->control_lock);
+	mutex_lock(&st->lock);
+	st->buffered = false;
+	mutex_unlock(&st->lock);
+	if (!st->fsin_enabled)
+		sc_halt(st);
+	mutex_unlock(&st->control_lock);
 	return 0;
 }
 static const struct iio_buffer_setup_ops sc_buffer_ops = {
@@ -298,8 +404,108 @@ static ssize_t diagnostics_show(struct device *dev, struct device_attribute *att
 		atomic64_read(&st->late_reads), atomic64_read(&st->buffer_drops),
 		atomic64_read(&st->gaps), atomic64_read(&st->max_latency_ns), atomic64_read(&st->max_read_ns));
 }
+static ssize_t fsin_enable_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct sc7u22 *st = iio_priv(dev_to_iio_dev(dev));
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", READ_ONCE(st->fsin_enabled));
+}
+static ssize_t fsin_enable_store(struct device *dev, struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct sc7u22 *st = iio_priv(dev_to_iio_dev(dev));
+	unsigned long flags;
+	bool enable;
+	int ret = kstrtobool(buf, &enable);
+
+	if (ret)
+		return ret;
+	if (!st->fsin_gpio)
+		return -ENODEV;
+	mutex_lock(&st->control_lock);
+	if (enable && !st->fsin_enabled) {
+		/* Start/read the IMU first; do not trigger on held startup data. */
+		ret = sc_run(st);
+		if (!ret) {
+			raw_spin_lock_irqsave(&st->fsin_lock, flags);
+			st->fsin_divider = 0;
+			st->fsin_pulses = 0;
+			st->fsin_last_irq = 0;
+			st->fsin_last_irq_ns = 0;
+			st->fsin_rise_ns = 0;
+			st->fsin_max_rise_delay_ns = 0;
+			st->fsin_max_high_ns = 0;
+			st->fsin_overruns = 0;
+			st->fsin_enabled = true;
+			raw_spin_unlock_irqrestore(&st->fsin_lock, flags);
+		}
+	} else if (!enable) {
+		sc_fsin_disarm(st);
+		if (!st->buffered)
+			sc_halt(st);
+	}
+	mutex_unlock(&st->control_lock);
+	return ret ?: count;
+}
+static ssize_t fsin_pulse_limit_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct sc7u22 *st = iio_priv(dev_to_iio_dev(dev));
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", READ_ONCE(st->fsin_limit));
+}
+static ssize_t fsin_pulse_limit_store(struct device *dev, struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct sc7u22 *st = iio_priv(dev_to_iio_dev(dev));
+	u32 n;
+	int ret = kstrtou32(buf, 10, &n);
+
+	if (ret || n > 10000000)
+		return ret ?: -EINVAL;
+	mutex_lock(&st->control_lock);
+	if (st->fsin_enabled)
+		ret = -EBUSY;
+	else
+		st->fsin_limit = n;
+	mutex_unlock(&st->control_lock);
+	return ret ?: count;
+}
+static ssize_t fsin_diagnostics_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct sc7u22 *st = iio_priv(dev_to_iio_dev(dev));
+	unsigned long flags;
+	u32 limit;
+	bool enabled;
+	u64 pulses, irq, stamp, rise, delay, high, overruns;
+
+	/* Only snapshot under the IRQ lock; formatting must not delay FSIN. */
+	raw_spin_lock_irqsave(&st->fsin_lock, flags);
+	enabled = st->fsin_enabled;
+	limit = st->fsin_limit;
+	pulses = st->fsin_pulses;
+	irq = st->fsin_last_irq;
+	stamp = st->fsin_last_irq_ns;
+	rise = st->fsin_rise_ns;
+	delay = st->fsin_max_rise_delay_ns;
+	high = st->fsin_max_high_ns;
+	overruns = st->fsin_overruns;
+	raw_spin_unlock_irqrestore(&st->fsin_lock, flags);
+	return scnprintf(buf, PAGE_SIZE,
+	 "available=%u\nenable=%u\ndivider=10\npulse_width_ns=100000\npulse_limit=%u\n"
+	 "pulses=%llu\nlast_irq_count=%llu\nlast_irq_ns=%llu\nlast_gpio_write_ns=%llu\n"
+	 "max_irq_to_gpio_write_ns=%llu\nmax_gpio_high_ns=%llu\noverruns=%llu\n",
+	 !!st->fsin_gpio, enabled, limit, pulses, irq, stamp, rise, delay, high, overruns);
+}
+static IIO_DEVICE_ATTR_RW(fsin_enable, 0);
+static IIO_DEVICE_ATTR_RW(fsin_pulse_limit, 0);
+static IIO_DEVICE_ATTR_RO(fsin_diagnostics, 0);
 static IIO_DEVICE_ATTR_RO(diagnostics, 0);
-static struct attribute *sc_attrs[] = { &iio_dev_attr_diagnostics.dev_attr.attr, NULL };
+static struct attribute *sc_attrs[] = {
+	&iio_dev_attr_diagnostics.dev_attr.attr,
+	&iio_dev_attr_fsin_enable.dev_attr.attr,
+	&iio_dev_attr_fsin_pulse_limit.dev_attr.attr,
+	&iio_dev_attr_fsin_diagnostics.dev_attr.attr, NULL
+};
 static const struct attribute_group sc_group = { .attrs = sc_attrs };
 static const struct iio_info sc_info = { .read_raw = sc_read_raw, .attrs = &sc_group };
 #define SC_CHAN(type_, axis_, index_) { .type = type_, .modified = 1, \
@@ -316,7 +522,8 @@ static void sc_shutdown(void *private)
 {
 	struct sc7u22 *st = private;
 
-	sc_stop(st);
+	sc_fsin_disarm(st);
+	sc_halt(st);
 }
 static int sc_probe(struct spi_device *spi)
 {
@@ -333,6 +540,30 @@ static int sc_probe(struct spi_device *spi)
 	st = iio_priv(indio);
 	st->spi = spi;
 	mutex_init(&st->lock);
+	mutex_init(&st->control_lock);
+	raw_spin_lock_init(&st->fsin_lock);
+	hrtimer_init(&st->fsin_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_HARD);
+	st->fsin_timer.function = sc_fsin_fall;
+	st->fsin_gpio = devm_gpiod_get_optional(&spi->dev, "fsin", GPIOD_OUT_LOW);
+	if (IS_ERR(st->fsin_gpio))
+		return PTR_ERR(st->fsin_gpio);
+	if (st->fsin_gpio) {
+		u32 mux[3], v;
+		void __iomem *reg;
+
+		if (gpiod_cansleep(st->fsin_gpio))
+			return dev_err_probe(&spi->dev, -EINVAL, "FSIN requires non-sleeping GPIO\n");
+		/* This SDK lacks a pinctrl mapping for the PWR pad. DT supplies
+		 * register/mask/value; never switch to independently clocked PWM. */
+		ret = of_property_read_u32_array(spi->dev.of_node, "silan,fsin-pinmux", mux, 3);
+		if (ret)
+			return ret;
+		reg = devm_ioremap(&spi->dev, mux[0], 4);
+		if (!reg)
+			return -ENOMEM;
+		v = readl(reg);
+		writel((v & ~mux[1]) | (mux[2] & mux[1]), reg);
+	}
 	spi->mode = SPI_MODE_3;
 	spi->max_speed_hz = min(spi->max_speed_hz, 1000000U);
 	spi->bits_per_word = 8;
@@ -357,9 +588,6 @@ static int sc_probe(struct spi_device *spi)
 		return ret;
 	msleep(200);
 	sc_stop(st);
-	ret = devm_add_action_or_reset(&spi->dev, sc_shutdown, st);
-	if (ret)
-		return ret;
 	indio->name = "sc7u22";
 	indio->info = &sc_info;
 	indio->modes = INDIO_DIRECT_MODE | INDIO_BUFFER_SOFTWARE;
@@ -377,6 +605,9 @@ static int sc_probe(struct spi_device *spi)
 	irq_set_status_flags(spi->irq, IRQ_NOAUTOEN);
 	ret = devm_request_threaded_irq(&spi->dev, spi->irq, sc_irq, sc_thread,
 				IRQF_ONESHOT, "sc7u22", indio);
+	if (ret)
+		return ret;
+	ret = devm_add_action_or_reset(&spi->dev, sc_shutdown, st);
 	if (ret)
 		return ret;
 	ret = devm_iio_device_register(&spi->dev, indio);

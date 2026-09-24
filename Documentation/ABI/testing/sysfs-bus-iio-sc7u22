@@ -1,0 +1,38 @@
+What:           /sys/bus/iio/devices/iio:deviceX/fsin_enable
+Date:           September 2026
+KernelVersion:  5.10 (TideSense vendor kernel)
+Contact:        TideSense maintainers
+Description:
+                SC7U22-specific camera trigger enable (0/1, default 0).
+                Requires non-sleeping fsin-gpios and silan,fsin-pinmux DT
+                register/mask/value. Every tenth delivered 200 Hz INT1 IRQ
+                raises FSIN; a hard hrtimer lowers it after 100 us.
+                Enabling maintains IMU sampling independently of the IIO
+                buffer. Disabling drives FSIN low and stops the IMU only
+                if no IIO buffer is enabled. IIO buffer transitions do not
+                reset an active trigger divider. No PWM fallback.
+
+What:           /sys/bus/iio/devices/iio:deviceX/fsin_pulse_limit
+Date:           September 2026
+KernelVersion:  5.10 (TideSense vendor kernel)
+Contact:        TideSense maintainers
+Description:
+                0 for continuous triggers (default), 1..10000000 for a
+                finite train. Writable only when fsin_enable is zero.
+                Reaching the limit suppresses further pulses but leaves
+                fsin_enable set and IMU sampling active until disabled.
+
+What:           /sys/bus/iio/devices/iio:deviceX/fsin_diagnostics
+Date:           September 2026
+KernelVersion:  5.10 (TideSense vendor kernel)
+Contact:        TideSense maintainers
+Description:
+                Read-only newline-separated key=value software counters.
+                Reports availability, enable, divider, target high width,
+                pulse limit/count, last trigger IRQ count, CLOCK_MONOTONIC
+                IRQ/GPIO-write timestamps (ns), maximum IRQ-entry-to-write
+                and high duration (ns), and skipped triggers caused by a
+                still-high output (overruns). Trigger statistics reset on
+                each disabled-to-enabled transition, unlike diagnostics'
+                cumulative IMU IRQ count. Timestamps do not measure physical
+                IRQ-edge latency, camera exposure or IMU filter delay.
