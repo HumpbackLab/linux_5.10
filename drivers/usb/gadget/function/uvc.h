@@ -65,7 +65,8 @@ extern unsigned int uvc_gadget_trace_param;
  * Driver specific constants
  */
 
-#define UVC_NUM_REQUESTS			4
+/* Four milliseconds of HS microframes tolerate A53 scheduling latency. */
+#define UVC_NUM_REQUESTS			32
 #define UVC_MAX_REQUEST_SIZE			64
 #define UVC_MAX_EVENTS				4
 
@@ -89,6 +90,7 @@ struct uvc_video {
 
 	/* Requests */
 	unsigned int req_size;
+	bool enabled;
 	struct usb_request *req[UVC_NUM_REQUESTS];
 	__u8 *req_buffer[UVC_NUM_REQUESTS];
 	struct list_head req_free;
@@ -112,6 +114,7 @@ enum uvc_state {
 };
 
 struct uvc_device {
+	bool keep_connected;
 	struct video_device vdev;
 	struct v4l2_device v4l2_dev;
 	enum uvc_state state;

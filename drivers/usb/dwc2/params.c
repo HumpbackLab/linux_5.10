@@ -164,6 +164,10 @@ static void dwc2_set_stm32f7_hsotg_params(struct dwc2_hsotg *hsotg)
 }
 
 #if IS_ENABLED(CONFIG_ARCH_CVITEK)
+static bool gadget_desc_dma = true;
+module_param(gadget_desc_dma, bool, 0444);
+MODULE_PARM_DESC(gadget_desc_dma, "Use descriptor DMA for the CVITEK USB gadget");
+
 static void dwc2_set_cv182x_params(struct dwc2_hsotg *hsotg)
 {
 	struct dwc2_core_params *p = &hsotg->params;
@@ -174,7 +178,7 @@ static void dwc2_set_cv182x_params(struct dwc2_hsotg *hsotg)
 	p->ahbcfg = GAHBCFG_HBSTLEN_INCR16 << GAHBCFG_HBSTLEN_SHIFT;
 	p->phy_utmi_width = 16;
 	p->g_dma = 1;
-	p->g_dma_desc = 1;
+	p->g_dma_desc = gadget_desc_dma;
 	p->lpm = false;
 	p->lpm_clock_gating = false;
 	p->besl = false;

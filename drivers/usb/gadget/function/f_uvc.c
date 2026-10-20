@@ -383,6 +383,8 @@ uvc_function_connect(struct uvc_device *uvc)
 {
 	int ret;
 
+	if (uvc->keep_connected)
+		return;
 	if ((ret = usb_function_activate(&uvc->func)) < 0)
 		uvcg_info(&uvc->func, "UVC connect failed with %d\n", ret);
 }
@@ -392,6 +394,8 @@ uvc_function_disconnect(struct uvc_device *uvc)
 {
 	int ret;
 
+	if (uvc->keep_connected)
+		return;
 	if ((ret = usb_function_deactivate(&uvc->func)) < 0)
 		uvcg_info(&uvc->func, "UVC disconnect failed with %d\n", ret);
 }
@@ -496,6 +500,10 @@ uvc_copy_descriptors(struct uvc_device *uvc, enum usb_device_speed speed)
 		break;
 	}
 
+	/* An HS-only camera must not advertise a mode it cannot deliver at FS.
+	 * Other functions (e.g. RNDIS) may still enumerate at full speed. */
+	if (speed == USB_SPEED_FULL && !uvc_streaming_cls && uvc->desc.hs_streaming)
+		return NULL;
 	if (!uvc_control_desc || !uvc_streaming_cls)
 		return ERR_PTR(-ENODEV);
 
@@ -930,6 +938,8 @@ static struct usb_function *uvc_alloc(struct usb_function_instance *fi)
 	uvc->desc.fs_streaming = opts->fs_streaming;
 	uvc->desc.hs_streaming = opts->hs_streaming;
 	uvc->desc.ss_streaming = opts->ss_streaming;
+	/* A composite debug network must survive UVC application restarts. */
+	uvc->keep_connected = opts->keep_connected;
 	++opts->refcnt;
 	mutex_unlock(&opts->lock);
 
@@ -942,7 +952,7 @@ static struct usb_function *uvc_alloc(struct usb_function_instance *fi)
 	uvc->func.disable = uvc_function_disable;
 	uvc->func.setup = uvc_function_setup;
 	uvc->func.free_func = uvc_free;
-	uvc->func.bind_deactivated = true;
+	uvc->func.bind_deactivated = !uvc->keep_connected;
 
 	return &uvc->func;
 }

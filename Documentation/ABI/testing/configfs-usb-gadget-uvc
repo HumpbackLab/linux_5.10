@@ -7,7 +7,24 @@ Description:	UVC function directory
 		streaming_maxburst	0..15 (ss only)
 		streaming_maxpacket	1..1023 (fs), 1..3072 (hs/ss)
 		streaming_interval	1..16
+		keep_connected		0..1 (default 0)
 		===================	=============================
+
+		With keep_connected=1, binding does not wait for a userspace
+		video producer and closing it does not deactivate the composite
+		gadget. This preserves other functions such as a debug network
+		across video process restarts. Set before linking the function.
+
+What:		/config/usb-gadget/gadget/functions/uvc.name/control/terminal/camera/default/bmControls
+What:		/config/usb-gadget/gadget/functions/uvc.name/control/processing/default/bmControls
+Date:		Oct 2026
+KernelVersion:	5.10 (TideSense SDK)
+Description:	Control bitmaps can be written before the UVC function is linked.
+		Accepts one unsigned integer bitmap in decimal or hexadecimal;
+		bytes are stored least significant first in the fixed descriptor.
+		Writing zero disables unsupported controls. Reads continue to
+		return one decimal byte per line. Out-of-range writes fail with
+		EINVAL; linked functions fail with EBUSY.
 
 What:		/config/usb-gadget/gadget/functions/uvc.name/control
 Date:		Dec 2014

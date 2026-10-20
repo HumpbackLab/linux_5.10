@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Silan SC7U22: 200 Hz, INT1 DRDY, hard-IRQ CLOCK_MONOTONIC timestamps.
+/* Silan SC7U22: 200/400 Hz, INT1 DRDY, hard-IRQ CLOCK_MONOTONIC timestamps.
  * Register/IIO layout based on ncerzzk's rk3506 SC7U22 IIO driver.
  * No synthetic timestamps and no polling fallback.
  */
@@ -46,17 +46,18 @@
 #define SC_CONF_ERROR     (BIT(4) | BIT(5))
 #define SC_PERFORMANCE    BIT(7)
 #define SC_ODR_200        9
-#define SC_CONF_200       (SC_PERFORMANCE | SC_ODR_200) /* BWP=0: OSR4 */
+#define SC_ODR_400        10
 #define SC_16G            3
 #define SC_2000DPS        0
 #define SC_POWER_AGT      (BIT(1) | BIT(2) | BIT(3))
-#define SC_PERIOD_NS      5000000LL
 #define SC_FSIN_DIVIDER   10
 #define SC_FSIN_HIGH_NS   100000LL
 
 struct sc7u22 {
 	struct spi_device *spi;
 	struct mutex lock, control_lock;
+	u32 rate_hz;
+	s64 period_ns;
 	struct gpio_desc *fsin_gpio;
 	struct hrtimer fsin_timer;
 	raw_spinlock_t fsin_lock;
@@ -146,11 +147,12 @@ static void sc_stop(struct sc7u22 *st)
 }
 static int sc_start(struct sc7u22 *st)
 {
-	static const struct { u8 reg, value; } config[] = {
+	u8 conf = SC_PERFORMANCE | (st->rate_hz == 400 ? SC_ODR_400 : SC_ODR_200);
+	const struct { u8 reg, value; } config[] = {
 		{ SC_SEG_SEL, 0 }, { SC_COM_CONF, SC_COM_DEFAULT },
 		{ SC_INT1_SEL1, 0 }, { SC_INT1_SEL2, 0 }, { SC_PWR_CTRL, 0 },
 		{ SC_ACC_RANGE, SC_16G }, { SC_GYR_RANGE, SC_2000DPS },
-		{ SC_ACC_CONF, SC_CONF_200 }, { SC_GYR_CONF, SC_CONF_200 },
+		{ SC_ACC_CONF, conf }, { SC_GYR_CONF, conf }, /* BWP=0: OSR4 */
 		{ SC_FIFO_CFG0, 0 }, { SC_FIFO_CFG1, 0 },
 		{ SC_PWR_CTRL, SC_POWER_AGT },
 	};
@@ -256,21 +258,21 @@ static irqreturn_t sc_thread(int irq, void *private)
 	struct sc7u22 *st = iio_priv(indio);
 	struct sc7u22_scan scan = {};
 	s64 stamp = READ_ONCE(st->irq_ns), start = ktime_get_ns(), end;
-	u8 raw[12], status;
+	u8 raw[13], status;
 	int ret, i;
 
 	sc_max(&st->max_latency_ns, start - stamp);
 	mutex_lock(&st->lock);
 	if (!st->enabled)
 		goto out;
-	ret = sc_read(st, SC_STATUS, &status, 1);
-	if (ret)
-		goto out;
-	ret = sc_read(st, SC_ACC_XH, raw, sizeof(raw));
+	/* STATUS and the six axes are consecutive. One burst avoids two extra
+	 * SPI pump round trips per sample, particularly important at 400 Hz. */
+	ret = sc_read(st, SC_STATUS, raw, sizeof(raw));
 	end = ktime_get_ns();
 	sc_max(&st->max_read_ns, end - stamp);
 	if (ret)
 		goto out;
+	status = raw[0];
 	if (st->discard_first) {
 		st->discard_first = false;
 		goto out; /* The first routed DRDY may describe data held during startup. */
@@ -282,17 +284,17 @@ static irqreturn_t sc_thread(int irq, void *private)
 	/* BDU protects words, not an unlimited history. Never label a possibly
 	 * overwritten sample with an old IRQ timestamp after a missed deadline.
 	 */
-	if (end - stamp >= SC_PERIOD_NS) {
+	if (end - stamp >= st->period_ns) {
 		atomic64_inc(&st->late_reads);
 		goto out;
 	}
-	if (st->last_ns && stamp - st->last_ns > SC_PERIOD_NS * 3 / 2)
+	if (st->last_ns && stamp - st->last_ns > st->period_ns * 3 / 2)
 		atomic64_inc(&st->gaps);
 	st->last_ns = stamp;
 	if (!st->buffered)
 		goto out; /* Camera-only mode still reads/acknowledges every DRDY. */
 	for (i = 0; i < 6; ++i)
-		scan.axis[i] = cpu_to_le16(get_unaligned_be16(raw + i * 2));
+		scan.axis[i] = cpu_to_le16(get_unaligned_be16(raw + 1 + i * 2));
 	ret = iio_push_to_buffers_with_timestamp(indio, &scan, stamp);
 	if (ret)
 		atomic64_inc(&st->buffer_drops);
@@ -382,7 +384,9 @@ static int sc_read_raw(struct iio_dev *indio, const struct iio_chan_spec *ch,
 		       int *val, int *val2, long mask)
 {
 	if (mask == IIO_CHAN_INFO_SAMP_FREQ) {
-		*val = 200;
+		struct sc7u22 *st = iio_priv(indio);
+
+		*val = READ_ONCE(st->rate_hz);
 		return IIO_VAL_INT;
 	}
 	if (mask == IIO_CHAN_INFO_SCALE) {
@@ -391,6 +395,29 @@ static int sc_read_raw(struct iio_dev *indio, const struct iio_chan_spec *ch,
 		return IIO_VAL_INT_PLUS_NANO;
 	}
 	return -EINVAL;
+}
+static int sc_write_raw(struct iio_dev *indio, const struct iio_chan_spec *ch,
+			int val, int val2, long mask)
+{
+	struct sc7u22 *st = iio_priv(indio);
+	int ret;
+
+	if (mask != IIO_CHAN_INFO_SAMP_FREQ || val2 || (val != 200 && val != 400))
+		return -EINVAL;
+	ret = iio_device_claim_direct_mode(indio);
+	if (ret)
+		return ret;
+	mutex_lock(&st->control_lock);
+	if (st->enabled || st->fsin_enabled || st->buffered) {
+		ret = -EBUSY;
+	} else {
+		WRITE_ONCE(st->rate_hz, val);
+		st->period_ns = NSEC_PER_SEC / val;
+		ret = 0;
+	}
+	mutex_unlock(&st->control_lock);
+	iio_device_release_direct_mode(indio);
+	return ret;
 }
 static ssize_t diagnostics_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
@@ -500,14 +527,20 @@ static IIO_DEVICE_ATTR_RW(fsin_enable, 0);
 static IIO_DEVICE_ATTR_RW(fsin_pulse_limit, 0);
 static IIO_DEVICE_ATTR_RO(fsin_diagnostics, 0);
 static IIO_DEVICE_ATTR_RO(diagnostics, 0);
+static IIO_CONST_ATTR(in_accel_sampling_frequency_available, "200 400");
+static IIO_CONST_ATTR(in_anglvel_sampling_frequency_available, "200 400");
 static struct attribute *sc_attrs[] = {
+	&iio_const_attr_in_accel_sampling_frequency_available.dev_attr.attr,
+	&iio_const_attr_in_anglvel_sampling_frequency_available.dev_attr.attr,
 	&iio_dev_attr_diagnostics.dev_attr.attr,
 	&iio_dev_attr_fsin_enable.dev_attr.attr,
 	&iio_dev_attr_fsin_pulse_limit.dev_attr.attr,
 	&iio_dev_attr_fsin_diagnostics.dev_attr.attr, NULL
 };
 static const struct attribute_group sc_group = { .attrs = sc_attrs };
-static const struct iio_info sc_info = { .read_raw = sc_read_raw, .attrs = &sc_group };
+static const struct iio_info sc_info = {
+	.read_raw = sc_read_raw, .write_raw = sc_write_raw, .attrs = &sc_group,
+};
 #define SC_CHAN(type_, axis_, index_) { .type = type_, .modified = 1, \
 	.channel2 = IIO_MOD_##axis_, .scan_index = index_, \
 	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE) | BIT(IIO_CHAN_INFO_SAMP_FREQ), \
@@ -538,6 +571,8 @@ static int sc_probe(struct spi_device *spi)
 	if (!indio)
 		return -ENOMEM;
 	st = iio_priv(indio);
+	st->rate_hz = 200;
+	st->period_ns = NSEC_PER_SEC / 200;
 	st->spi = spi;
 	mutex_init(&st->lock);
 	mutex_init(&st->control_lock);
@@ -624,5 +659,5 @@ static struct spi_driver sc_driver = {
 	.probe = sc_probe, .id_table = sc_ids,
 };
 module_spi_driver(sc_driver);
-MODULE_DESCRIPTION("SC7U22 200 Hz INT1 timestamped IIO IMU");
+MODULE_DESCRIPTION("SC7U22 200/400 Hz INT1 timestamped IIO IMU");
 MODULE_LICENSE("GPL");

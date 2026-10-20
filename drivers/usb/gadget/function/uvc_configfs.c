@@ -319,7 +319,50 @@ static ssize_t uvcg_default_processing_bm_controls_show(
 	return result;
 }
 
-UVC_ATTR_RO(uvcg_default_processing_, bm_controls, bmControls);
+/* Accept a fixed-size little-endian control bitmap while the function is
+ * unlinked. This permits applications to advertise no unsupported controls.
+ * Older SDKs exposed only read-only defaults (AE mode and brightness). */
+static ssize_t uvcg_controls_store(struct config_item *item, const char *page,
+				  size_t len, bool camera)
+{
+	struct config_group *group = to_config_group(item);
+	struct mutex *su_mutex = &group->cg_subsys->su_mutex;
+	struct config_item *opts_item = item;
+	struct f_uvc_opts *opts;
+	u32 bitmap;
+	u8 *controls;
+	unsigned int i, size;
+	int ret = kstrtou32(page, 0, &bitmap);
+
+	if (ret)
+		return ret;
+	mutex_lock(su_mutex);
+	for (i = 0; i < (camera ? 4 : 3); ++i)
+		opts_item = opts_item->ci_parent;
+	opts = to_f_uvc_opts(opts_item);
+	mutex_lock(&opts->lock);
+	controls = camera ? opts->uvc_camera_terminal.bmControls : opts->uvc_processing.bmControls;
+	size = camera ? sizeof(opts->uvc_camera_terminal.bmControls) : sizeof(opts->uvc_processing.bmControls);
+	if (opts->refcnt)
+		ret = -EBUSY;
+	else if ((u64)bitmap >= (1ULL << (size * 8)))
+		ret = -EINVAL;
+	else {
+		for (i = 0; i < size; ++i)
+			controls[i] = bitmap >> (8 * i);
+		ret = len;
+	}
+	mutex_unlock(&opts->lock);
+	mutex_unlock(su_mutex);
+	return ret;
+}
+
+static ssize_t uvcg_default_processing_bm_controls_store(
+	struct config_item *item, const char *page, size_t len)
+{
+	return uvcg_controls_store(item, page, len, false);
+}
+UVC_ATTR(uvcg_default_processing_, bm_controls, bmControls);
 
 static struct configfs_attribute *uvcg_default_processing_attrs[] = {
 	&uvcg_default_processing_attr_b_unit_id,
@@ -430,7 +473,12 @@ static ssize_t uvcg_default_camera_bm_controls_show(
 	return result;
 }
 
-UVC_ATTR_RO(uvcg_default_camera_, bm_controls, bmControls);
+static ssize_t uvcg_default_camera_bm_controls_store(
+	struct config_item *item, const char *page, size_t len)
+{
+	return uvcg_controls_store(item, page, len, true);
+}
+UVC_ATTR(uvcg_default_camera_, bm_controls, bmControls);
 
 static struct configfs_attribute *uvcg_default_camera_attrs[] = {
 	&uvcg_default_camera_attr_b_terminal_id,
@@ -2761,6 +2809,7 @@ end:									\
 UVC_ATTR(f_uvc_opts_, cname, cname)
 
 UVCG_OPTS_ATTR(streaming_interval, streaming_interval, 16);
+UVCG_OPTS_ATTR(keep_connected, keep_connected, 1);
 UVCG_OPTS_ATTR(streaming_maxpacket, streaming_maxpacket, 3072);
 UVCG_OPTS_ATTR(streaming_maxburst, streaming_maxburst, 15);
 
@@ -2768,6 +2817,7 @@ UVCG_OPTS_ATTR(streaming_maxburst, streaming_maxburst, 15);
 
 static struct configfs_attribute *uvc_attrs[] = {
 	&f_uvc_opts_attr_streaming_interval,
+	&f_uvc_opts_attr_keep_connected,
 	&f_uvc_opts_attr_streaming_maxpacket,
 	&f_uvc_opts_attr_streaming_maxburst,
 	NULL,

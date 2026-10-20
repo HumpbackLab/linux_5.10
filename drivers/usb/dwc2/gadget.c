@@ -967,6 +967,35 @@ static int dwc2_gadget_fill_isoc_desc(struct dwc2_hsotg_ep *hs_ep,
 	return 0;
 }
 
+/* DIEPMSK is shared by all IN endpoints. Only request NAK interrupts while
+ * an ISOC IN queue needs its first host token for frame synchronization.
+ * Leaving it enabled also interrupts on every NAK from idle bulk endpoints
+ * (for example RNDIS), starving a composite gadget's video and CPU work.
+ * The caller holds hsotg->lock.
+ */
+static void dwc2_gadget_update_isoc_nak_mask(struct dwc2_hsotg *hsotg)
+{
+	u32 mask = dwc2_readl(hsotg, DIEPMSK);
+	bool needed = false;
+	int i;
+
+	for (i = 1; i < hsotg->num_of_eps; i++) {
+		struct dwc2_hsotg_ep *ep = hsotg->eps_in[i];
+
+		if (ep && ep->isochronous && ep->ep.desc &&
+		    ep->target_frame == TARGET_FRAME_INITIAL &&
+		    !list_empty(&ep->queue)) {
+			needed = true;
+			break;
+		}
+	}
+	if (needed)
+		mask |= DIEPMSK_NAKMSK;
+	else
+		mask &= ~DIEPMSK_NAKMSK;
+	dwc2_writel(hsotg, mask, DIEPMSK);
+}
+
 /*
  * dwc2_gadget_start_isoc_ddma - start isochronous transfer in DDMA
  * @hs_ep: The isochronous endpoint.
@@ -988,6 +1017,7 @@ static void dwc2_gadget_start_isoc_ddma(struct dwc2_hsotg_ep *hs_ep)
 
 	if (list_empty(&hs_ep->queue)) {
 		hs_ep->target_frame = TARGET_FRAME_INITIAL;
+		dwc2_gadget_update_isoc_nak_mask(hsotg);
 		dev_dbg(hsotg->dev, "%s: No requests in queue\n", __func__);
 		return;
 	}
@@ -1455,6 +1485,8 @@ static int dwc2_hsotg_ep_queue(struct usb_ep *ep, struct usb_request *req,
 
 	first = list_empty(&hs_ep->queue);
 	list_add_tail(&hs_req->queue, &hs_ep->queue);
+	if (hs_ep->dir_in && hs_ep->isochronous)
+		dwc2_gadget_update_isoc_nak_mask(hs);
 
 	/*
 	 * Handle DDMA isochronous transfers separately - just add new entry
@@ -2240,6 +2272,8 @@ static void dwc2_gadget_handle_isoc_bna(struct dwc2_hsotg_ep *hs_ep)
 	hs_ep->target_frame = TARGET_FRAME_INITIAL;
 	hs_ep->next_desc = 0;
 	hs_ep->compl_desc = 0;
+	if (hs_ep->dir_in)
+		dwc2_gadget_update_isoc_nak_mask(hsotg);
 }
 
 /**
@@ -2980,6 +3014,7 @@ static void dwc2_gadget_handle_nak(struct dwc2_hsotg_ep *hs_ep)
 			}
 
 			dwc2_gadget_start_isoc_ddma(hs_ep);
+			dwc2_gadget_update_isoc_nak_mask(hsotg);
 			return;
 		}
 
@@ -2995,12 +3030,16 @@ static void dwc2_gadget_handle_nak(struct dwc2_hsotg_ep *hs_ep)
 			dwc2_writel(hsotg, ctrl, DIEPCTL(hs_ep->index));
 		}
 
-		dwc2_hsotg_complete_request(hsotg, hs_ep,
-					    get_ep_head(hs_ep), 0);
+		/* The first IN token synchronizes the endpoint; it has not
+		 * transferred the queue head. Start it rather than reporting
+		 * a zero-byte success and losing the first UVC payload.
+		 */
+		dwc2_gadget_start_next_request(hs_ep);
 	}
 
 	if (!using_desc_dma(hsotg))
 		dwc2_gadget_incr_frame_num(hs_ep);
+	dwc2_gadget_update_isoc_nak_mask(hsotg);
 }
 
 /**
@@ -4079,9 +4118,6 @@ static int dwc2_hsotg_ep_enable(struct usb_ep *ep,
 		hs_ep->compl_desc = 0;
 		if (dir_in) {
 			hs_ep->periodic = 1;
-			mask = dwc2_readl(hsotg, DIEPMSK);
-			mask |= DIEPMSK_NAKMSK;
-			dwc2_writel(hsotg, mask, DIEPMSK);
 		} else {
 			mask = dwc2_readl(hsotg, DOEPMSK);
 			mask |= DOEPMSK_OUTTKNEPDISMSK;
@@ -4237,6 +4273,8 @@ static int dwc2_hsotg_ep_disable(struct usb_ep *ep)
 
 	/* terminate all requests with shutdown */
 	kill_all_requests(hsotg, hs_ep, -ESHUTDOWN);
+	if (dir_in && hs_ep->isochronous)
+		dwc2_gadget_update_isoc_nak_mask(hsotg);
 
 	hsotg->fifo_map &= ~(1 << hs_ep->fifo_index);
 	hs_ep->fifo_index = 0;

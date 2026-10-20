@@ -210,7 +210,8 @@ uvc_video_complete(struct usb_ep *ep, struct usb_request *req)
 	list_add_tail(&req->list, &video->req_free);
 	spin_unlock_irqrestore(&video->req_lock, flags);
 
-	schedule_work(&video->pump);
+	if (READ_ONCE(video->enabled))
+		schedule_work(&video->pump);
 }
 
 static int
@@ -323,6 +324,8 @@ static void uvcg_video_pump(struct work_struct *work)
 	int ret;
 
 	while (1) {
+		if (!READ_ONCE(video->enabled))
+			return;
 		/* Retrieve the first available USB request, protected by the
 		 * request lock.
 		 */
@@ -341,12 +344,20 @@ static void uvcg_video_pump(struct work_struct *work)
 		 */
 		spin_lock_irqsave(&queue->irqlock, flags);
 		buf = uvcg_queue_head(queue);
-		if (buf == NULL) {
+		/* Keep the ISO endpoint scheduled between compressed frames.
+		 * A JPEG occupies only part of a camera period. Letting the
+		 * endpoint underrun in every gap can lose the next first packet
+		 * when the controller resynchronizes. Empty USB transactions do
+		 * not add bytes or change the UVC frame ID.
+		 */
+		if (buf)
+			video->encode(req, video, buf);
+		else if (usb_endpoint_xfer_isoc(video->ep->desc))
+			req->length = 0;
+		else {
 			spin_unlock_irqrestore(&queue->irqlock, flags);
 			break;
 		}
-
-		video->encode(req, video, buf);
 
 		if (!video->ep->enabled) {
 			spin_unlock_irqrestore(&queue->irqlock, flags);
@@ -384,6 +395,7 @@ int uvcg_video_enable(struct uvc_video *video, int enable)
 	}
 
 	if (!enable) {
+		WRITE_ONCE(video->enabled, false);
 		cancel_work_sync(&video->pump);
 		uvcg_queue_cancel(&video->queue, 0);
 
@@ -408,6 +420,7 @@ int uvcg_video_enable(struct uvc_video *video, int enable)
 	} else
 		video->encode = uvc_video_encode_isoc;
 
+	WRITE_ONCE(video->enabled, true);
 	schedule_work(&video->pump);
 
 	return ret;

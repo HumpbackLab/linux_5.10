@@ -22,6 +22,7 @@
 struct f_uvc_opts {
 	struct usb_function_instance			func_inst;
 	unsigned int					streaming_interval;
+	unsigned int					keep_connected;
 	unsigned int					streaming_maxpacket;
 	unsigned int					streaming_maxburst;
 
