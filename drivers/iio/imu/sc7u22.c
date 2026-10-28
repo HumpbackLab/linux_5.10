@@ -45,6 +45,7 @@
 #define SC_READY          (BIT(0) | BIT(1))
 #define SC_CONF_ERROR     (BIT(4) | BIT(5))
 #define SC_PERFORMANCE    BIT(7)
+#define SC_BWP_NORMAL     (2 << 4)
 #define SC_ODR_200        9
 #define SC_ODR_400        10
 #define SC_16G            3
@@ -147,12 +148,16 @@ static void sc_stop(struct sc7u22 *st)
 }
 static int sc_start(struct sc7u22 *st)
 {
-	u8 conf = SC_PERFORMANCE | (st->rate_hz == 400 ? SC_ODR_400 : SC_ODR_200);
+	/* Normal bandwidth minimizes averaging at 200 Hz; the main data path
+	 * has no unfiltered mode. ACC averages 2 and GYR averages 4 samples.
+	 */
+	u8 conf = SC_PERFORMANCE | SC_BWP_NORMAL |
+		(st->rate_hz == 400 ? SC_ODR_400 : SC_ODR_200);
 	const struct { u8 reg, value; } config[] = {
 		{ SC_SEG_SEL, 0 }, { SC_COM_CONF, SC_COM_DEFAULT },
 		{ SC_INT1_SEL1, 0 }, { SC_INT1_SEL2, 0 }, { SC_PWR_CTRL, 0 },
 		{ SC_ACC_RANGE, SC_16G }, { SC_GYR_RANGE, SC_2000DPS },
-		{ SC_ACC_CONF, conf }, { SC_GYR_CONF, conf }, /* BWP=0: OSR4 */
+		{ SC_ACC_CONF, conf }, { SC_GYR_CONF, conf },
 		{ SC_FIFO_CFG0, 0 }, { SC_FIFO_CFG1, 0 },
 		{ SC_PWR_CTRL, SC_POWER_AGT },
 	};
